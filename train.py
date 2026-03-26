@@ -1,5 +1,5 @@
 import os
-
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import random
@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 # from utils import print_and_save, shuffling, epoch_time
 # from network.Mart_Unet import MartingaleUNet
-from network.lianxi import MedSegNet
+from network.no_gating import MedSegNetV2_NoGate
 
 from metrics import DiceBCELoss
 from run_engine import *
@@ -21,7 +21,14 @@ from sklearn.utils import shuffle
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
-from utils.run_model import load_data, train, evaluate, DATASET, CompositeLoss, FocalLoss, DiceLoss, combined_loss
+# from utils.run_model import load_data, train, evaluate, DATASET, CompositeLoss, FocalLoss, DiceLoss, combined_loss
+from utils.run_model import (
+    DATASET, load_data, get_train_transform,
+    train, evaluate, combined_loss
+)
+
+
+
 from sklearn.metrics import accuracy_score
 import torch.backends.cudnn as cudnn
 import cv2
@@ -30,6 +37,46 @@ import numpy as np
 cudnn.enabled = True
 cudnn.benchmark = False  # 禁用自动最优算法搜索
 cudnn.deterministic = True  # 强制使用确定性算法
+
+"""
+自定义新的loss，包含
+
+Binary Cross Entropy (BCE) Loss
+用于衡量每个像素的概率预测与真实标签之间的差异。
+优点：数值稳定，对常见样本表现好。
+缺点：对类别不平衡（前景远小于背景）非常敏感。
+
+Dice Loss
+衡量预测分割和真实 mask 的重叠程度（类似于 F1-score）。
+优点：对前景区域特别敏感，能有效引导模型聚焦前景。
+常用于医学图像分割或小目标识别任务。
+
+DiceFocal Loss
+通过动态调整难易样本的权重，使模型更关注难以分类的前景像素。
+对于大背景、小前景的情况尤其有帮助。
+例如病变检测或遥感目标检测中极为有效。
+
+MultiClassBCE Loss
+
+
+
+"""
+
+def get_train_transform():
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-45, 45), p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
+        A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=10, val_shift_limit=10, p=0.3),
+        A.GaussNoise(mean=0, std=20, p=0.3),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+        A.ElasticTransform(alpha=1, sigma=50, p=0.3),
+        A.GridDistortion(num_steps=5, distort_limit=0.03, p=0.3),
+        A.CoarseDropout(max_holes=8, max_height=32, max_width=32, fill_value=0, p=0.4)
+    ])
+
 
 
 def my_seeding(seed):
@@ -64,7 +111,7 @@ def print_and_save(file_path, data_str):
 
 if __name__ == '__main__':
     # 训练集和验证集
-    dataset_name = 'ISIC2016'
+    dataset_name = 'ISIC2018'
     val_name = 'Val_Images'
 
     # 定义随机种子
@@ -74,8 +121,8 @@ if __name__ == '__main__':
     # 训练相关参数
     image_size = 256
     size = (image_size, image_size)
-    batch_size = 4
-    num_epochs = 200
+    batch_size = 8
+    num_epochs = 500
     lr = 1e-4
     early_stopping_patience = 100
 
@@ -83,10 +130,9 @@ if __name__ == '__main__':
     folder_name = f"train_{dataset_name}_{val_name}_lr{lr}_{current_time}"
 
     # 输入路径和权重保存路径设置
-    base_dir = r".\data"
-    # data_path = os.path.join(base_dir, dataset_name)
-    data_path = os.path.join(".", "data", "ISIC2017")
-    save_dir = os.path.join("073run_files", dataset_name, folder_name)
+    base_dir = r"./data"
+    data_path = os.path.join(base_dir, dataset_name)
+    save_dir = os.path.join("No_Gating_MS_Review_MedSegNetV2_run_files", dataset_name, folder_name)
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
@@ -110,12 +156,13 @@ if __name__ == '__main__':
 
     """ Data augmentation: Transforms """
 
-    transform = A.Compose([
-        A.Rotate(limit=90, p=0.5),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.CoarseDropout(p=0.3, max_holes=10, max_height=32, max_width=32)
-    ])
+    # transform = A.Compose([
+    #     A.Rotate(limit=90, p=0.5),
+    #     A.HorizontalFlip(p=0.5),
+    #     A.VerticalFlip(p=0.5),
+    #     A.CoarseDropout(p=0.3, max_holes=10, max_height=32, max_width=32)
+    # ])
+    # transform = get_train_transform()
 
     """ Dataset and loader"""
     (train_x, train_y), (valid_x, valid_y) = load_data(data_path, val_name)
@@ -138,11 +185,13 @@ if __name__ == '__main__':
     # plt.show()
     # print('mask unique:', np.unique(mask))
 
+
     train_x, train_y = shuffling(train_x, train_y)
     data_str = f"Dataset Size:\nTrain: {len(train_x)} - Valid: {len(valid_x)}\n"
     print_and_save(train_log_path, data_str)
 
-    train_dataset = DATASET(train_x, train_y, (image_size, image_size), transform=transform)
+    train_transform = get_train_transform()
+    train_dataset = DATASET(train_x, train_y, (image_size, image_size), transform=train_transform)
     valid_dataset = DATASET(valid_x, valid_y, (image_size, image_size), transform=None)
 
     train_loader = DataLoader(
@@ -166,11 +215,14 @@ if __name__ == '__main__':
     """ Model """
     device = torch.device('cuda')
     # 先暂时这么写，后续再改
-    model = MedSegNet()
-
-    model = model.to(device)
+    # model = MedSegNet()
+    #
+    # model = model.to(device)
+    model = MedSegNetV2_NoGate().to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=30, verbose=True)
     # loss_fn = CompositeLoss(
     #     alpha=1.0,  # BCE 权重
@@ -181,20 +233,47 @@ if __name__ == '__main__':
     # )
     # loss_name = "CompositeLoss"
 
-    dice_loss_fn = DiceLoss()
-    focal_loss_fn = FocalLoss()
+
+
+
+
+
 
     # loss_fn = combined_loss(pred, y)
     # loss_name = "combined_loss"
-    dice_loss_fn = DiceLoss()
-    focal_loss_fn = FocalLoss()
+    # dice_loss_fn = DiceLoss()
+    # focal_loss_fn = FocalLoss()
 
 
-    def combined_loss(logits, targets):
-        return 0.5 * dice_loss_fn(logits, targets) + 0.5 * focal_loss_fn(logits, targets)
+    # def combined_loss(logits, targets):
+    #     return 0.5 * dice_loss_fn(logits, targets) + 0.5 * focal_loss_fn(logits, targets)
 
+    # def combined_loss(pred, targets):
+    #     def single_loss(logits, targets):
+    #         # 把 aux logits 插值到 GT 尺寸
+    #         if logits.shape[-2:] != targets.shape[-2:]:
+    #             logits = F.interpolate(
+    #                 logits,
+    #                 size=targets.shape[-2:],
+    #                 mode="bilinear",
+    #                 align_corners=False
+    #             )
+    #         return 0.5 * dice_loss_fn(logits, targets) + 0.5 * focal_loss_fn(logits, targets)
+    #
+    #     if isinstance(pred, dict):
+    #         loss_main = single_loss(pred["main"], targets)
+    #         loss_aux3 = single_loss(pred["aux3"], targets)
+    #         loss_aux2 = single_loss(pred["aux2"], targets)
+    #         loss_aux1 = single_loss(pred["aux1"], targets)
+    #
+    #         return loss_main + 0.4 * loss_aux3 + 0.2 * loss_aux2 + 0.1 * loss_aux1
+    #     else:
+    #         return single_loss(pred, targets)
 
-    loss_fn = combined_loss  # 注意这里没有括号！
+    loss_fn = combined_loss
+    train_transform = get_train_transform()
+
+    # loss_fn = combined_loss  # 注意这里没有括号！
     loss_name = "combined_loss"
 
     data_str = f"Optimizer: Adam\nLoss: {loss_name}\n"
@@ -212,6 +291,9 @@ if __name__ == '__main__':
         start_time = time.time()
 
         train_loss, train_metrics = train(model, train_loader, optimizer, loss_fn, device)
+        # 清理 PyTorch GPU 缓存，防止碎片化
+        torch.cuda.empty_cache()
+
         valid_loss, valid_metrics = evaluate(model, valid_loader, loss_fn, device)
         scheduler.step(valid_loss)
 
